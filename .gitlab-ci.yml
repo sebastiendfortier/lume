@@ -1,0 +1,94 @@
+stages:
+  - test
+  - build
+  - deploy
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+
+.setup_cargo_musl:
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  before_script:
+    - |
+      if [ -n "${CI_HTTP_PROXY:-}" ]; then
+        export http_proxy="${CI_HTTP_PROXY}"
+        export https_proxy="${CI_HTTP_PROXY}"
+        export HTTP_PROXY="${CI_HTTP_PROXY}"
+        export HTTPS_PROXY="${CI_HTTP_PROXY}"
+      fi
+      if [ -n "${CI_ENV_INIT:-}" ] && [ -f "${CI_ENV_INIT}" ]; then
+        source "${CI_ENV_INIT}" 2>/dev/null || true
+      fi
+      if [ -n "${CI_CARGO_BIN:-}" ] && [ -d "${CI_CARGO_BIN}" ]; then
+        export PATH="${CI_CARGO_BIN}:${PATH}"
+      fi
+      if [ -n "${CI_MUSL_BIN:-}" ] && [ -d "${CI_MUSL_BIN}" ]; then
+        export PATH="${CI_MUSL_BIN}:${PATH}"
+      fi
+      unset CC CXX LDFLAGS LIBRARY_PATH LIBPATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH LD_LIBRARY_PATH
+      export CC_x86_64_unknown_linux_gnu=gcc
+      export CXX_x86_64_unknown_linux_gnu=g++
+      export CC_x86_64_unknown_linux_musl=musl-gcc
+      export CXX_x86_64_unknown_linux_musl=musl-g++
+      if [ -n "${TMPDIR:-}" ] && [ ! -d "${TMPDIR}" ]; then export TMPDIR="/tmp"; fi
+      cd "${CI_PROJECT_DIR}"
+
+test:cargo:
+  extends: .setup_cargo_musl
+  stage: test
+  timeout: 20m
+  script:
+    - cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+    - cargo test --workspace --lib --bins --locked --target x86_64-unknown-linux-musl
+
+build:package-ssm:
+  extends: .setup_cargo_musl
+  stage: build
+  timeout: 30m
+  script:
+    - cargo build --release --locked --target x86_64-unknown-linux-musl -p lume-cli
+    - ./scripts/build-ssm.sh
+    - ldd target/x86_64-unknown-linux-musl/release/lume 2>&1 || true
+  artifacts:
+    name: "lume-ssm-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - dist/lume_*_all.ssm
+      - target/x86_64-unknown-linux-musl/release/lume
+    expire_in: 1 week
+
+deploy:release:
+  extends: .setup_cargo_musl
+  stage: deploy
+  timeout: 15m
+  needs:
+    - test:cargo
+    - build:package-ssm
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/ && $CI_DEPLOY_SSH && $CI_APPS_DOMAIN'
+      when: on_success
+  script:
+    - |
+      set -e
+      TARBALL="$(ls -1 dist/lume_*_all.ssm | head -n 1)"
+      PKG_NAME="$(basename "$TARBALL" .ssm)"
+      chmod 644 "$TARBALL"
+      ABS_TARBALL="$(readlink -f "$TARBALL")"
+      ssh -o BatchMode=yes "${CI_DEPLOY_SSH}" bash -lc "'
+        set -e
+        DOM=${CI_APPS_DOMAIN}
+        if [ ! -d \"\$DOM/etc/ssm.d\" ]; then ssm created -d \"\$DOM\"; fi
+        ssm install -d \"\$DOM\" -f \"${ABS_TARBALL}\"
+        ssm publish -d \"\$DOM\" -p \"${PKG_NAME}\" -pp all
+        ln -sfn \"${PKG_NAME}\" \"\$DOM/latest\"
+      '"

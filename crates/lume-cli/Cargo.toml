@@ -1,0 +1,18 @@
+[package]
+name = "lume-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "lume: Pixel-rendered & ANSI terminal Markdown viewer and live two-pane editor"
+
+[[bin]]
+name = "lume"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+lume-core = { path = "../lume-core" }
+notify = "7"
+ratatui = "0.29"
